@@ -163,6 +163,15 @@ function initWhipStreaming() {
     };
     
     const startStream = async () => {
+        // WebRTC 推流必须在安全上下文下运行：HTTPS 或 localhost/127.0.0.1
+        const isLocalhost = ['localhost', '127.0.0.1'].includes(location.hostname);
+        if (!window.isSecureContext && !isLocalhost) {
+            const msg = `无法访问摄像头/麦克风。请通过 HTTPS 或 localhost 访问后再推流。`;
+            console.error(msg);
+            showToast(msg, 'error');
+            return;
+        }
+
         try {
             console.log('开始推流...');
             
