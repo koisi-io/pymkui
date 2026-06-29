@@ -30,6 +30,19 @@
             }
         }
     </script>
+    <style>
+        /* select 下拉选项继承当前深色主题，避免白底白字看不清 */
+        select option {
+            background-color: #1e293b;
+            color: #ffffff;
+        }
+
+        /* 下拉列表中当前选中项高亮 */
+        select option:checked {
+            background-color: #6366f1;
+            color: #ffffff;
+        }
+    </style>
     <style type="text/tailwindcss">
         @layer utilities {
             .content-auto {
