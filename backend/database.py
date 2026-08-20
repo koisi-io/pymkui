@@ -4,6 +4,7 @@ Database management module for PyMKUI
 import os
 import sqlite3
 import json
+import threading
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 import config
@@ -12,18 +13,28 @@ import mk_logger
 class Database:
     def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path if db_path else config.DATABASE_PATH
-        self.connection: sqlite3.Connection
-        self.cursor: sqlite3.Cursor
+        self._thread_local = threading.local()
         self.init_db()
-    
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Return a connection owned by the current OS thread."""
+        connection = getattr(self._thread_local, "connection", None)
+        if connection is None:
+            connection = sqlite3.connect(
+                self.db_path,
+                timeout=10.0,
+                check_same_thread=True,
+                cached_statements=0,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 10000")
+            self._thread_local.connection = connection
+        return connection
+
     def init_db(self):
         """Initialize database connection"""
-        self.connection = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.connection.row_factory = sqlite3.Row
-        self.cursor = self.connection.cursor()
-        # SQLite 默认不开启外键约束，每次连接后需手动启用
-        self.cursor.execute("PRAGMA foreign_keys = ON")
-
         self._create_tables()
     
     def _get_local_timezone(self):
@@ -80,14 +91,13 @@ class Database:
             return None, None
 
     def _cursor(self) -> sqlite3.Cursor:
-        """每次调用返回一个新的独立游标，避免递归使用同一游标导致报错"""
-        cur = self.connection.cursor()
-        cur.execute("PRAGMA foreign_keys = ON")
-        return cur
+        """返回当前线程连接的新游标。"""
+        return self.connection.cursor()
     
     def _create_tables(self):
         """Create necessary tables"""
-        self.cursor.execute('''
+        cur = self._cursor()
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS pull_proxies (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 vhost TEXT NOT NULL DEFAULT '__defaultVhost__',
@@ -105,7 +115,7 @@ class Database:
 
         # 多地址表：每条代理可配置多个拉流地址，priority 越小越优先
         # params 字段（JSON）存储该地址专属参数，如 schema、rtp_type 等
-        self.cursor.execute('''
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS pull_proxy_urls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 proxy_id INTEGER NOT NULL,
@@ -117,7 +127,7 @@ class Database:
             )
         ''')
         
-        self.cursor.execute('''
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS push_tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -130,7 +140,7 @@ class Database:
             )
         ''')
         
-        self.cursor.execute('''
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS recordings (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 vhost       TEXT NOT NULL DEFAULT '__defaultVhost__',
@@ -147,7 +157,7 @@ class Database:
             )
         ''')
         
-        self.cursor.execute('''
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS protocol_options (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
@@ -180,7 +190,7 @@ class Database:
 
         # 插件事件绑定表：每条记录 = 一个事件类型 + 一个插件的绑定，含参数和优先级
         # priority 越小越先执行；params 为 JSON 对象，存储该绑定的自定义参数
-        self.cursor.execute('''
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS plugin_bindings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_type TEXT NOT NULL,
@@ -196,14 +206,15 @@ class Database:
         self.connection.commit()
 
         # 仅在 plugin_bindings 表为空时（首次建库）插入默认绑定
-        self.cursor.execute("SELECT COUNT(*) FROM plugin_bindings")
-        if self.cursor.fetchone()[0] == 0:
-            self._init_default_plugin_bindings()
+        cur.execute("SELECT COUNT(*) FROM plugin_bindings")
+        if cur.fetchone()[0] == 0:
+            self._init_default_plugin_bindings(cur)
 
         mk_logger.log_info(f"Database initialized at {self.db_path}")
 
-    def _init_default_plugin_bindings(self):
+    def _init_default_plugin_bindings(self, cur: Optional[sqlite3.Cursor] = None):
         """插入内置插件的默认绑定记录（仅首次建库、表为空时调用）"""
+        cur = cur or self._cursor()
         defaults = [
             ("on_stream_not_found",    "pull_proxy_on_demand",  "{}", 0, 1),
             ("on_player_proxy_failed", "pull_proxy_failover",   "{}", 0, 1),
@@ -213,7 +224,7 @@ class Database:
             ("on_record_mp4",          "record_mp4_logger",     "{}", 0, 1),
         ]
         for event_type, plugin_name, params, priority, enabled in defaults:
-            self.cursor.execute(
+            cur.execute(
                 """
                 INSERT INTO plugin_bindings
                     (event_type, plugin_name, params, priority, enabled)
@@ -225,9 +236,11 @@ class Database:
         mk_logger.log_info("[Database] 默认插件绑定已初始化")
     
     def close(self):
-        """Close database connection"""
-        if hasattr(self, 'connection') and self.connection:
-            self.connection.close()
+        """Close the connection owned by the current thread."""
+        connection = getattr(self._thread_local, "connection", None)
+        if connection is not None:
+            connection.close()
+            del self._thread_local.connection
     
     def add_proxy(self, app: str, stream: str, url: str, enabled: bool = True) -> Optional[Dict[str, Any]]:
         """Add a proxy configuration"""
@@ -677,6 +690,22 @@ class Database:
         except sqlite3.Error as e:
             print(f"Failed to get pull proxy: {e}")
             return None
+
+    def get_pull_proxy_by_stream(
+        self, vhost: str, app: str, stream: str, on_demand_only: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Get a pull proxy by media identity."""
+        try:
+            cur = self._cursor()
+            query = "SELECT * FROM pull_proxies WHERE vhost=? AND app=? AND stream=?"
+            if on_demand_only:
+                query += " AND on_demand=1"
+            cur.execute(query, (vhost, app, stream))
+            row = cur.fetchone()
+            return dict(row) if row else None
+        except sqlite3.Error as e:
+            mk_logger.log_warn(f"Failed to get pull proxy by stream: {e}")
+            return None
     
     def get_all_pull_proxies(self) -> List[Dict[str, Any]]:
         """Get all pull proxies"""
@@ -963,4 +992,3 @@ class Database:
         except sqlite3.Error as e:
             mk_logger.log_warn(f"increment_hit_count error: {e}")
             return False
-

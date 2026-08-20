@@ -32,16 +32,7 @@ class PullProxyOnDemand(PluginBase):
         app    = args.get("app",    "")
         stream = args.get("stream", "")
 
-        try:
-            db.cursor.execute(
-                "SELECT * FROM pull_proxies WHERE vhost=? AND app=? AND stream=? AND on_demand=1",
-                (vhost, app, stream)
-            )
-            row = db.cursor.fetchone()
-            proxy = dict(row) if row else None
-        except Exception as e:
-            mk_logger.log_warn(f"[pull_proxy_on_demand] 查询数据库失败: {e}")
-            proxy = None
+        proxy = db.get_pull_proxy_by_stream(vhost, app, stream, on_demand_only=True)
 
         if not proxy:
             return False
@@ -109,15 +100,10 @@ class PullProxyFailover(PluginBase):
             if not app or not stream:
                 return False
 
-            db.cursor.execute(
-                "SELECT * FROM pull_proxies WHERE vhost=? AND app=? AND stream=?",
-                (vhost, app, stream)
-            )
-            row = db.cursor.fetchone()
-            if not row:
+            proxy = db.get_pull_proxy_by_stream(vhost, app, stream)
+            if not proxy:
                 return False
 
-            proxy = dict(row)
             pid   = proxy.get("id")
             if not pid:
                 return False
